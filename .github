@@ -1,0 +1,137 @@
+name: test-direct-download
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: >
+          Enter one or more Direct Download URLs.
+          Separate by commas, spaces, or newlines.
+        required: true
+      bundle_all:
+        description: 'Bundle all downloaded files into a single split ZIP archive'
+        type: boolean
+        default: false
+      job_id:
+        description: 'Job ID (set automatically by bot)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  actions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Target Repository (my-files)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/my-files
+          token: ${{ secrets.SECOND_REPO_TOKEN }}
+
+      - name: Install dependencies (aria2 & zip)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 zip
+
+      - name: Download, Zip and Split files
+        run: |
+          URLS_INPUT="${{ github.event.inputs.url }}"
+          BUNDLE_ALL="${{ github.event.inputs.bundle_all }}"
+          
+          WORKDIR="/tmp/dl_workspace"
+          UPLOAD_DIR="/tmp/upload_workspace"
+          mkdir -p "$WORKDIR" "$UPLOAD_DIR"
+          
+          URLS=$(echo "$URLS_INPUT" | tr ',' ' ' | tr '\n' ' ' | tr -s ' ' | sed 's/^ *//;s/ * $//')
+          if [ -z "$URLS" ]; then
+            echo "No URLs provided." >&2
+            exit 1
+          fi
+          echo "$URLS" | tr ' ' '\n' > "$WORKDIR/urls.txt"
+          
+          index=0
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            index=$((index + 1))
+            echo "----------------------------------------"
+            echo "Processing URL $index: $url"
+            
+            DL_DIR="$WORKDIR/dl_$index"
+            mkdir -p "$DL_DIR"
+            
+            aria2c -x 16 -s 16 -d "$DL_DIR" --console-log-level=warn --summary-interval=10 "$url" || true
+            
+            DL_FILE=$(ls -1 "$DL_DIR" 2>/dev/null | head -n1)
+            if [ -z "$DL_FILE" ]; then
+              echo "Download failed or no file found for $url"
+              continue
+            fi
+            
+            echo "Downloaded: $DL_FILE"
+            
+            if [ "$BUNDLE_ALL" = "true" ]; then
+              BUNDLE_DIR="$WORKDIR/bundle"
+              mkdir -p "$BUNDLE_DIR"
+              TARGET="$BUNDLE_DIR/$DL_FILE"
+              if [ -e "$TARGET" ]; then
+                base="${DL_FILE%.*}"
+                ext="${DL_FILE##*.}"
+                if [ "$base" = "$ext" ]; then
+                  base="$DL_FILE"; ext=""
+                else
+                  ext=".$ext"
+                fi
+                counter=1
+                while [ -e "$BUNDLE_DIR/${base}_${counter}${ext}" ]; do
+                  counter=$((counter + 1))
+                done
+                TARGET="$BUNDLE_DIR/${base}_${counter}${ext}"
+              fi
+              mv "$DL_DIR/$DL_FILE" "$TARGET"
+            else
+              RAND5=$(openssl rand -hex 3)
+              ZIP_NAME="${DL_FILE}_${RAND5}.zip"
+              echo "Zipping and splitting: $ZIP_NAME"
+              (cd "$DL_DIR" && zip -0 -s 99m "$UPLOAD_DIR/$ZIP_NAME" "$DL_FILE")
+            fi
+          done < "$WORKDIR/urls.txt"
+          
+          if [ "$BUNDLE_ALL" = "true" ]; then
+            BUNDLE_DIR="$WORKDIR/bundle"
+            if [ -d "$BUNDLE_DIR" ] && [ -n "$(ls -A "$BUNDLE_DIR" 2>/dev/null)" ]; then
+              RAND_BUNDLE=$(openssl rand -hex 3)
+              BUNDLE_ZIP="bundle_${RAND_BUNDLE}.zip"
+              echo "Zipping bundle: $BUNDLE_ZIP"
+              (cd "$BUNDLE_DIR" && zip -s 99m "$UPLOAD_DIR/$BUNDLE_ZIP" *)
+            fi
+          fi
+
+      - name: Force Push to Repo2 (Reset History)
+        run: |
+          UPLOAD_DIR="/tmp/upload_workspace"
+          JOB_ID="${{ github.event.inputs.job_id }}"
+          
+          if [ -z "$(ls -A "$UPLOAD_DIR" 2>/dev/null)" ]; then
+            echo "No files generated to upload."
+            exit 0
+          fi
+          
+          git checkout --orphan temp_branch
+          git rm -rf .
+          cp -r "$UPLOAD_DIR"/* ./
+          
+          # ─── اضافه کردن job_meta.json ───
+          if [ -n "$JOB_ID" ]; then
+            echo "{\"job_id\":\"$JOB_ID\",\"status\":\"ready\"}" > job_meta.json
+            echo "✅ job_meta.json created for job: $JOB_ID"
+          fi
+          # ────────────────────────────────
+          
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add .
+          git commit -m "🚀 Auto upload | job:${JOB_ID:-manual}"
+          git branch -M main
+          git push --force origin main
