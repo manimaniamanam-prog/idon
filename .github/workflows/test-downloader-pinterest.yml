@@ -1,0 +1,132 @@
+name: test-downloader-pinterest
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: >
+          Pinterest video URL
+          مثال: pinterest.com/pin/1234567890/ یا pin.it/XXXXXX
+        required: true
+      job_id:
+        description: 'Job ID (set automatically by bot)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── ۱. نصب ابزارها ──────────────────────────────────────────
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg curl zip
+
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+            -o /usr/local/bin/yt-dlp
+          sudo chmod +x /usr/local/bin/yt-dlp
+          yt-dlp --version
+
+      # ── ۲. کوکی اختیاری (فقط اگه پین محدودیت داشت لازم می‌شه) ──
+      - name: Write cookies (optional)
+        run: |
+          if [ -n "$PINTEREST_COOKIES" ]; then
+            echo "$PINTEREST_COOKIES" > /tmp/pinterest_cookies.txt
+            echo "✅ Pinterest cookies loaded"
+          else
+            echo "ℹ️  No cookies — downloading as guest"
+          fi
+        env:
+          PINTEREST_COOKIES: ${{ secrets.PINTEREST_COOKIES }}
+
+      # ── ۳. دانلود ویدیو ─────────────────────────────────────────
+      - name: Download Pinterest video
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          mkdir -p /tmp/downloads
+
+          COOKIE_ARGS=""
+          [ -f /tmp/pinterest_cookies.txt ] && COOKIE_ARGS="--cookies /tmp/pinterest_cookies.txt"
+
+          # ✅ بدون --merge-output-format (همون باگی که در TikTok داشتیم)
+          yt-dlp \
+            $COOKIE_ARGS \
+            --no-playlist \
+            -f "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best" \
+            -o "/tmp/downloads/pinterest_%(id)s.%(ext)s" \
+            "$URL" || true
+
+          # چک مستقل — صرف‌نظر از exit code بالا
+          FILE_COUNT=$(find /tmp/downloads -type f 2>/dev/null | wc -l)
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "⚠️ First attempt failed, trying fallback..."
+            yt-dlp \
+              $COOKIE_ARGS \
+              --no-playlist \
+              -o "/tmp/downloads/pinterest_%(id)s.%(ext)s" \
+              "$URL" || true
+          fi
+
+          echo "Downloaded files:"
+          ls -lh /tmp/downloads/ 2>/dev/null || echo "(empty)"
+
+          # ✅ استفاده از if — نه && — که exit code اشتباه ندهد
+          if [ -z "$(ls -A /tmp/downloads 2>/dev/null)" ]; then
+            echo "::error::Download failed — لینک نامعتبر است یا پین ویدیو ندارد"
+            exit 1
+          fi
+          echo "✅ Download successful"
+
+      # ── ۴. فشرده‌سازی ───────────────────────────────────────────
+      - name: Archive video
+        run: |
+          mkdir -p /tmp/upload
+          RAND=$(openssl rand -hex 3)
+          FNAME=$(ls -1 /tmp/downloads | head -1)
+          SAFE_NAME=$(echo "$FNAME" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g')
+          ZIP_NAME="${SAFE_NAME%.*}_${RAND}.zip"
+
+          echo "Creating: $ZIP_NAME"
+          (cd /tmp/downloads && zip -0 -s 95m "/tmp/upload/$ZIP_NAME" *)
+
+          echo "Archive contents:"
+          ls -lh /tmp/upload/
+
+          # ✅ if به‌جای && (همون رفع باگ قبلی)
+          if [ -z "$(ls -A /tmp/upload 2>/dev/null)" ]; then
+            echo "::error::Archive empty"
+            exit 1
+          fi
+          echo "✅ Archive ready"
+
+      # ── ۵. چک‌اوت Repo2 ─────────────────────────────────────────
+      - name: Checkout Repo2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/my-files
+          token: ${{ secrets.SECOND_REPO_TOKEN }}
+          path: repo2
+
+      # ── ۶. Force push ─────────────────────────────────────────────
+      - name: Force push to Repo2 with job_meta
+        run: |
+          JOB_ID="${{ github.event.inputs.job_id }}"
+          cd repo2
+          git checkout --orphan temp_branch 2>/dev/null || true
+          git rm -rf . 2>/dev/null || true
+          cp /tmp/upload/* ./
+          if [ -n "$JOB_ID" ]; then
+            echo "{\"job_id\":\"$JOB_ID\",\"status\":\"ready\"}" > job_meta.json
+          fi
+          git config user.name  "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "pinterest:${JOB_ID:-manual}"
+          git branch -M main
+          git push --force origin main
+          echo "✅ Done"

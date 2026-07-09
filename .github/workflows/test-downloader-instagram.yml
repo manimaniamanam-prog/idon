@@ -1,0 +1,109 @@
+name: test-downloader-instagram
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Instagram URLs – separate by comma, space, or newline'
+        required: true
+      job_id:
+        description: 'Job ID (set automatically by bot)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  actions:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq ffmpeg zip python3-pip
+          pip3 install --quiet gallery-dl
+
+      - name: Write cookies (if available)
+        run: |
+          if [ -n "$INSTAGRAM_COOKIES" ]; then
+            echo "$INSTAGRAM_COOKIES" > instagram-cookies.txt
+            echo "Cookies written."
+          fi
+        env:
+          INSTAGRAM_COOKIES: ${{ secrets.INSTAGRAM_COOKIES }}
+
+      - name: Parse Instagram URLs
+        run: |
+          INPUT="${{ github.event.inputs.urls }}"
+          CLEANED=$(echo "$INPUT" | tr -d "\"'")
+          echo "$CLEANED" | grep -oP 'https?://(www\.)?instagram\.com/[^\s,;]+' \
+            | sort -u > /tmp/urls.txt
+          if [ ! -s /tmp/urls.txt ]; then
+            echo "No valid Instagram URLs." >&2; exit 1
+          fi
+          echo "URLs to download:"
+          cat /tmp/urls.txt
+
+      - name: Download Instagram content
+        run: |
+          mkdir -p /tmp/ig_downloads
+          GALLERY_ARGS=""
+          [ -f instagram-cookies.txt ] && GALLERY_ARGS="--cookies instagram-cookies.txt"
+
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            echo "Downloading: $url"
+            for attempt in 1 2 3; do
+              gallery-dl $GALLERY_ARGS -d /tmp/ig_downloads "$url" --no-part \
+                && break || sleep 30
+            done
+          done < /tmp/urls.txt
+
+          if [ -z "$(find /tmp/ig_downloads -type f 2>/dev/null)" ]; then
+            echo "No files downloaded." >&2; exit 1
+          fi
+          echo "Downloaded files:"
+          find /tmp/ig_downloads -type f | head -20
+
+      - name: Archive files
+        run: |
+          mkdir -p /tmp/upload
+          RAND=$(openssl rand -hex 3)
+          ZIP_NAME="instagram_${RAND}.zip"
+          (cd /tmp/ig_downloads && find . -type f | zip -0 -s 95m "/tmp/upload/$ZIP_NAME" -@)
+          echo "Archive:"
+          ls -lh /tmp/upload/
+
+      - name: Checkout Repo2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/my-files
+          token: ${{ secrets.SECOND_REPO_TOKEN }}
+          path: repo2
+
+      - name: Force push to Repo2 with job_meta
+        run: |
+          JOB_ID="${{ github.event.inputs.job_id }}"
+          cd repo2
+
+          git checkout --orphan temp_branch 2>/dev/null || true
+          git rm -rf . 2>/dev/null || true
+
+          cp /tmp/upload/* ./
+
+          if [ -n "$JOB_ID" ]; then
+            echo "{\"job_id\":\"$JOB_ID\",\"status\":\"ready\"}" > job_meta.json
+          fi
+
+          git config user.name  "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "instagram:${JOB_ID:-manual}"
+          git branch -M main
+          git push --force origin main
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf /tmp/ig_downloads instagram-cookies.txt 2>/dev/null || true

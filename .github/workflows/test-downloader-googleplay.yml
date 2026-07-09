@@ -1,0 +1,136 @@
+name: test-downloader-googleplay
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: >
+          Package name یا Google Play URL
+          مثال: org.telegram.messenger
+          یا: https://play.google.com/store/apps/details?id=org.telegram.messenger
+        required: true
+        type: string
+      job_id:
+        description: 'Job ID (set automatically by bot)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── ۱. نصب apkeep ────────────────────────────────────────────
+      - name: Install apkeep
+        run: |
+          sudo curl -L https://github.com/EFForg/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-gnu \
+            -o /usr/local/bin/apkeep
+          sudo chmod +x /usr/local/bin/apkeep
+          apkeep --version
+          sudo apt-get update -qq && sudo apt-get install -y -qq zip
+
+      # ── ۲. پارس package name ─────────────────────────────────────
+      - name: Parse package name
+        id: parse
+        run: |
+          INPUT="${{ github.event.inputs.app }}"
+          INPUT=$(echo "$INPUT" | xargs)
+
+          if echo "$INPUT" | grep -qE '^https?://'; then
+            PKG=$(echo "$INPUT" | grep -oP '(?<=id=)[^&]+')
+            if [ -z "$PKG" ]; then
+              echo "::error::Could not extract package name from URL"
+              exit 1
+            fi
+          else
+            PKG="$INPUT"
+          fi
+
+          echo "Package: $PKG"
+          echo "package=$PKG" >> $GITHUB_OUTPUT
+
+      # ── ۳. دانلود مستقیم از Google Play ─────────────────────────
+      - name: Download APK from Google Play
+        run: |
+          PKG="${{ steps.parse.outputs.package }}"
+          mkdir -p /tmp/apk_downloads
+
+          if [ -z "$GPLAY_EMAIL" ] || [ -z "$GPLAY_AAS_TOKEN" ]; then
+            echo "::error::GPLAY_EMAIL یا GPLAY_AAS_TOKEN تنظیم نشده — راهنما را دنبال کن"
+            exit 1
+          fi
+
+          echo "Downloading $PKG from Google Play (official)..."
+          apkeep \
+            -a "$PKG" \
+            -d google-play \
+            -e "$GPLAY_EMAIL" \
+            -t "$GPLAY_AAS_TOKEN" \
+            --accept-tos \
+            /tmp/apk_downloads/
+
+          echo "Downloaded files:"
+          ls -lhR /tmp/apk_downloads/
+
+          if [ -z "$(find /tmp/apk_downloads -name '*.apk' 2>/dev/null)" ]; then
+            echo "::error::No APK downloaded for $PKG"
+            echo "علت‌های احتمالی:"
+            echo "  - AAS token منقضی شده → helper workflow را دوباره اجرا کن"
+            echo "  - برنامه در region این اکانت موجود نیست"
+            echo "  - برنامه پولی است (فقط برنامه‌های رایگان پشتیبانی می‌شوند)"
+            exit 1
+          fi
+          echo "✅ Download successful"
+        env:
+          GPLAY_EMAIL: ${{ secrets.GPLAY_EMAIL }}
+          GPLAY_AAS_TOKEN: ${{ secrets.GPLAY_AAS_TOKEN }}
+
+      # ── ۴. فشرده‌سازی ───────────────────────────────────────────
+      - name: Archive APK files
+        run: |
+          mkdir -p /tmp/upload
+          RAND=$(openssl rand -hex 3)
+          PKG="${{ steps.parse.outputs.package }}"
+          ZIP_NAME="${PKG}_${RAND}.zip"
+
+          echo "Creating: $ZIP_NAME"
+          (cd /tmp/apk_downloads && find . -name "*.apk" -print0 | \
+            xargs -0 zip -0 -s 95m "/tmp/upload/$ZIP_NAME")
+
+          echo "Archive:"
+          ls -lh /tmp/upload/
+
+          if [ -z "$(ls -A /tmp/upload 2>/dev/null)" ]; then
+            echo "::error::Archive empty"
+            exit 1
+          fi
+          echo "✅ Archive ready"
+
+      # ── ۵. چک‌اوت Repo2 ─────────────────────────────────────────
+      - name: Checkout Repo2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/my-files
+          token: ${{ secrets.SECOND_REPO_TOKEN }}
+          path: repo2
+
+      # ── ۶. Force push به Repo2 ──────────────────────────────────
+      - name: Force push to Repo2 with job_meta
+        run: |
+          JOB_ID="${{ github.event.inputs.job_id }}"
+          cd repo2
+          git checkout --orphan temp_branch 2>/dev/null || true
+          git rm -rf . 2>/dev/null || true
+          cp /tmp/upload/* ./
+          if [ -n "$JOB_ID" ]; then
+            echo "{\"job_id\":\"$JOB_ID\",\"status\":\"ready\"}" > job_meta.json
+          fi
+          git config user.name  "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "googleplay:${JOB_ID:-manual}"
+          git branch -M main
+          git push --force origin main
+          echo "✅ Done"

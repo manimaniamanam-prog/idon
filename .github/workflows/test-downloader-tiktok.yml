@@ -1,0 +1,113 @@
+name: test-downloader-tiktok
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'TikTok video URL'
+        required: true
+      job_id:
+        description: 'Job ID (set automatically by bot)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg curl zip
+
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+            -o /usr/local/bin/yt-dlp
+          sudo chmod +x /usr/local/bin/yt-dlp
+          yt-dlp --version
+
+      - name: Write cookies (optional)
+        run: |
+          if [ -n "$TIKTOK_COOKIES" ]; then
+            echo "$TIKTOK_COOKIES" > /tmp/tiktok_cookies.txt
+            echo "✅ TikTok cookies loaded"
+          else
+            echo "ℹ️  No cookies — downloading as guest"
+          fi
+        env:
+          TIKTOK_COOKIES: ${{ secrets.TIKTOK_COOKIES }}
+
+      - name: Download TikTok video
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          mkdir -p /tmp/downloads
+
+          COOKIE_ARGS=""
+          [ -f /tmp/tiktok_cookies.txt ] && COOKIE_ARGS="--cookies /tmp/tiktok_cookies.txt"
+
+          # ✅ بدون --merge-output-format که باعث exit 1 می‌شد
+          yt-dlp \
+            $COOKIE_ARGS \
+            --no-playlist \
+            -f "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best" \
+            -o "/tmp/downloads/%(uploader)s_%(id)s.%(ext)s" \
+            "$URL" || true   # ← ادامه حتی اگه yt-dlp warning بده
+
+          echo "Downloaded files:"
+          ls -lh /tmp/downloads/ 2>/dev/null || echo "(empty)"
+
+          # ✅ رفع باگ: از if استفاده کن نه && که exit code اشتباه می‌داد
+          if [ -z "$(ls -A /tmp/downloads 2>/dev/null)" ]; then
+            echo "::error::Download failed — no files"
+            exit 1
+          fi
+          echo "✅ Download successful"
+
+      - name: Archive video
+        run: |
+          mkdir -p /tmp/upload
+          RAND=$(openssl rand -hex 3)
+          FNAME=$(ls -1 /tmp/downloads | head -1)
+          SAFE_NAME=$(echo "$FNAME" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g')
+          ZIP_NAME="${SAFE_NAME%.*}_${RAND}.zip"
+
+          echo "Creating: $ZIP_NAME"
+          (cd /tmp/downloads && zip -0 -s 95m "/tmp/upload/$ZIP_NAME" *)
+
+          echo "Archive contents:"
+          ls -lh /tmp/upload/
+
+          # ✅ رفع باگ: از if استفاده کن نه && که exit code اشتباه می‌داد
+          if [ -z "$(ls -A /tmp/upload 2>/dev/null)" ]; then
+            echo "::error::Archive empty"
+            exit 1
+          fi
+          echo "✅ Archive ready"
+
+      - name: Checkout Repo2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/my-files
+          token: ${{ secrets.SECOND_REPO_TOKEN }}
+          path: repo2
+
+      - name: Force push to Repo2 with job_meta
+        run: |
+          JOB_ID="${{ github.event.inputs.job_id }}"
+          cd repo2
+          git checkout --orphan temp_branch 2>/dev/null || true
+          git rm -rf . 2>/dev/null || true
+          cp /tmp/upload/* ./
+          if [ -n "$JOB_ID" ]; then
+            echo "{\"job_id\":\"$JOB_ID\",\"status\":\"ready\"}" > job_meta.json
+          fi
+          git config user.name  "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "tiktok:${JOB_ID:-manual}"
+          git branch -M main
+          git push --force origin main
+          echo "✅ Done"

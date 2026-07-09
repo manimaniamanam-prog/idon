@@ -1,0 +1,374 @@
+name: test-youtube-download
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'YouTube Video URL'
+        required: true
+      output_format:
+        description: 'Output Format'
+        required: true
+        default: 'mp4 (video)'
+      video_quality:
+        description: 'Video Quality'
+        required: true
+        default: 'best'
+      audio_quality:
+        description: 'Audio Quality'
+        required: true
+        default: 'best'
+      job_id:
+        description: 'Job ID'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  download_youtube:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout Source Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: '🔐 Prepare cookies'
+        run: |
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            echo "$YOUTUBE_COOKIES" > youtube-cookies.txt
+            echo "✅ YouTube cookies written from secret."
+          else
+            echo "ℹ️ No YOUTUBE_COOKIES secret – proceeding without cookies."
+          fi
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+
+      # ✅ FIX 1: v1.x → 2.x  (حداقل نیاز yt-dlp/EJS = Deno 2.0.0)
+      - name: Install Deno Runtime
+        uses: denoland/setup-deno@v1
+        with:
+          deno-version: 2.x
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq ffmpeg python3-pip
+          # ✅ FIX 2: pip install yt-dlp-ejs حذف شد (بی‌اثر بود)
+          # چون yt-dlp را از binary نصب می‌کنیم، پکیج pip تأثیری ندارد
+          python3 -m pip install requests --break-system-packages || \
+          python3 -m pip install requests
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+            -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+
+      - name: Create Temp Directory
+        id: tempdir
+        run: |
+          mkdir -p /tmp/downloaded_media
+          echo "TEMP_DIR=/tmp/downloaded_media" >> $GITHUB_OUTPUT
+
+      - name: Parse Single URL to JSON
+        id: parse
+        run: |
+          URL_INPUT="${{ github.event.inputs.url }}"
+          JSON_DATA=$(jq -c -n --arg url "$URL_INPUT" '[{link: $url}]')
+          echo "ENTRIES_JSON=$JSON_DATA" >> $GITHUB_OUTPUT
+
+      - name: '⬇️ Primary download'
+        id: primary_download
+        run: |
+          set -e
+
+          ENTRIES_JSON='${{ steps.parse.outputs.ENTRIES_JSON }}'
+          OUTPUT_FOLDER="${{ steps.tempdir.outputs.TEMP_DIR }}"
+          mkdir -p "$OUTPUT_FOLDER"
+
+          GLOBAL_FORMAT="${{ github.event.inputs.output_format }}"
+          GLOBAL_VQ="${{ github.event.inputs.video_quality }}"
+          GLOBAL_AQ="${{ github.event.inputs.audio_quality }}"
+
+          GLOBAL_VQ_NUM=$(echo "$GLOBAL_VQ" | grep -o '[0-9]*' | head -1)
+          GLOBAL_AQ_NUM=$(echo "$GLOBAL_AQ" | grep -o '[0-9]*' | head -1)
+          if [ "$GLOBAL_VQ" = "best" ]; then GLOBAL_VQ_NUM="max"; fi
+          if [ "$GLOBAL_AQ" = "best" ]; then GLOBAL_AQ_NUM="max"; fi
+
+          if [ "$GLOBAL_FORMAT" = "mp3 (audio only)" ]; then
+            GLOBAL_TYPE="a"; GLOBAL_VAL="$GLOBAL_AQ_NUM"
+          else
+            GLOBAL_TYPE="v"; GLOBAL_VAL="$GLOBAL_VQ_NUM"
+          fi
+
+          echo "🌐 Global defaults: type=$GLOBAL_TYPE quality=$GLOBAL_VAL"
+
+          # ✅ FIX 3: از -s (non-empty) به جای -f (exists) برای چک کوکی
+          # بدون این، فایل خالی هم باعث skip شدن iOS client می‌شد
+          COOKIE_ARGS=""
+          if [ -f youtube-cookies.txt ] && [ -s youtube-cookies.txt ]; then
+            COOKIE_ARGS="--cookies youtube-cookies.txt"
+          fi
+
+          # ✅ FIX 4: --remote-components ejs:github جایگزین --js-runtimes deno شد
+          # این روش EJS را از GitHub دانلود می‌کند (همیشه به‌روز، با هر runtime کار می‌کند)
+          YT_DLP_ARGS="$COOKIE_ARGS \
+            --remote-components ejs:github \
+            --extractor-args youtube:player_client=ios,tv,web_embedded \
+            --no-progress"
+
+          FAILED_ENTRIES='[]'
+          count=$(echo "$ENTRIES_JSON" | jq length)
+
+          for ((idx=0; idx<count; idx++)); do
+            link=$(echo "$ENTRIES_JSON" | jq -r ".[$idx].link")
+            type="$GLOBAL_TYPE"
+            val="$GLOBAL_VAL"
+
+            echo "========================================"
+            echo "📹 Processing $((idx+1))/$count: $link"
+            echo "🔧 Type: $type | Quality: $val"
+
+            if [ "$type" = "a" ]; then
+              if [ "$val" = "max" ]; then
+                FORMAT_STR="bestaudio/best"
+              elif [ "$val" = "min" ]; then
+                FORMAT_STR="worstaudio/worst"
+              else
+                FORMAT_STR="bestaudio[abr<=${val}]/bestaudio/best"
+              fi
+              echo "🎵 Audio format string: $FORMAT_STR"
+              if yt-dlp $YT_DLP_ARGS \
+                  -f "$FORMAT_STR" \
+                  --extract-audio --audio-format mp3 \
+                  -o "$OUTPUT_FOLDER/%(title)s-${val}kbps.%(ext)s" \
+                  "$link"; then
+                echo "✅ Audio download success"
+              else
+                echo "❌ Primary download failed – queued for fallback"
+                FAILED_ENTRIES=$(echo "$FAILED_ENTRIES" | \
+                  jq ". + [{link: \"$link\", type: \"$type\", val: \"$val\"}]")
+              fi
+            else
+              if [ "$val" = "max" ]; then
+                FORMAT_STR="bestvideo+bestaudio/best"
+              elif [ "$val" = "min" ]; then
+                FORMAT_STR="worstvideo+worstaudio/worst"
+              else
+                FORMAT_STR="bestvideo[height<=${val}]+bestaudio/best[height<=${val}]"
+              fi
+              echo "🎬 Video format string: $FORMAT_STR"
+              if yt-dlp $YT_DLP_ARGS \
+                  -f "$FORMAT_STR" \
+                  --merge-output-format mp4 \
+                  -o "$OUTPUT_FOLDER/%(title)s-${val}p.%(ext)s" \
+                  "$link"; then
+                echo "✅ Video download success"
+              else
+                echo "❌ Primary download failed – queued for fallback"
+                FAILED_ENTRIES=$(echo "$FAILED_ENTRIES" | \
+                  jq ". + [{link: \"$link\", type: \"$type\", val: \"$val\"}]")
+              fi
+            fi
+          done
+
+          FAILED_ENTRIES_JSON=$(echo "$FAILED_ENTRIES" | jq -c .)
+          echo "FAILED_ENTRIES_JSON=$FAILED_ENTRIES_JSON" >> $GITHUB_OUTPUT
+
+      - name: '🔄 Fallback pipelines'
+        if: steps.primary_download.outputs.FAILED_ENTRIES_JSON != '[]'
+        run: |
+          set -e
+
+          FAILED_ENTRIES='${{ steps.primary_download.outputs.FAILED_ENTRIES_JSON }}'
+          count=$(echo "$FAILED_ENTRIES" | jq length)
+          echo "🔄 Attempting fallback for $count failed entries..."
+          OUTPUT_FOLDER="${{ steps.tempdir.outputs.TEMP_DIR }}"
+
+          build_suffix() {
+            local type="$1" val="$2"
+            if [ "$type" = "a" ]; then echo "${val}kbps"; else echo "${val}p"; fi
+          }
+
+          COOKIE_ARGS=""
+          if [ -f youtube-cookies.txt ] && [ -s youtube-cookies.txt ]; then
+            COOKIE_ARGS="--cookies youtube-cookies.txt"
+          fi
+
+          fallback_piped() {
+            echo "[fallback] Piped API"
+            local url="$1" type="$2" val="$3"
+            local vid
+            vid=$(echo "$url" | sed -n 's/.*v=\([a-zA-Z0-9_-]\{11\}\).*/\1/p' | head -1)
+            if [ -z "$vid" ]; then return 1; fi
+
+            local instances=(
+              "https://pipedapi.kavin.rocks"
+              "https://pipedapi-libre.kavin.rocks"
+              "https://pipedapi.adminforge.de"
+              "https://pipedapi.syncpundit.com"
+            )
+            local info="" api_base=""
+            for inst in "${instances[@]}"; do
+              info=$(curl -s --max-time 15 "${inst}/streams/${vid}" 2>/dev/null)
+              if echo "$info" | jq -e '.videoStreams | length > 0' >/dev/null 2>&1; then
+                api_base="$inst"; break
+              fi
+            done
+            if [ -z "$api_base" ]; then return 1; fi
+
+            local title=$(echo "$info" | jq -r '.title // "video"')
+            local safe_title=$(echo "$title" | sed 's/[^a-zA-Z0-9._-]/_/g' | \
+              sed 's/__*/_/g' | head -c 100)
+            local suffix=$(build_suffix "$type" "$val")
+
+            if [ "$type" = "a" ]; then
+              local audio_url=$(echo "$info" | jq -r \
+                '.audioStreams | sort_by(-.bitrate) | .[0].url // ""')
+              if [ -z "$audio_url" ] || [ "$audio_url" = "null" ]; then return 1; fi
+              curl -L --fail --progress-bar --retry 3 \
+                -o "${OUTPUT_FOLDER}/${safe_title}-${suffix}.m4a" "$audio_url"
+            else
+              local maxh
+              if [ "$val" = "max" ]; then maxh=9999;
+              elif [ "$val" = "min" ]; then maxh=0;
+              else maxh="$val"; fi
+
+              local video_url=$(echo "$info" | jq -r --argjson maxh "$maxh" \
+                '.videoStreams | map(select(.videoOnly==true and .height<=$maxh)) |
+                 sort_by(-.height) | .[0].url // ""')
+              if [ -z "$video_url" ] || [ "$video_url" = "null" ]; then
+                video_url=$(echo "$info" | jq -r --argjson maxh "$maxh" \
+                  '.videoStreams | map(select(.height<=$maxh)) |
+                   sort_by(-.height) | .[0].url // ""')
+              fi
+              local audio_url=$(echo "$info" | jq -r \
+                '.audioStreams | sort_by(-.bitrate) | .[0].url // ""')
+              if [ -z "$video_url" ] || [ "$video_url" = "null" ] || \
+                 [ -z "$audio_url" ] || [ "$audio_url" = "null" ]; then return 1; fi
+
+              curl -L --fail --progress-bar --retry 3 \
+                -o "${OUTPUT_FOLDER}/.tmp_v" "$video_url" || return 1
+              curl -L --fail --progress-bar --retry 3 \
+                -o "${OUTPUT_FOLDER}/.tmp_a" "$audio_url" || return 1
+              ffmpeg -y -v quiet \
+                -i "${OUTPUT_FOLDER}/.tmp_v" \
+                -i "${OUTPUT_FOLDER}/.tmp_a" \
+                -c copy "${OUTPUT_FOLDER}/${safe_title}-${suffix}.mp4" 2>/dev/null
+              rm -f "${OUTPUT_FOLDER}/.tmp_v" "${OUTPUT_FOLDER}/.tmp_a"
+            fi
+          }
+
+          fallback_force_ipv4() {
+            local suf=$(build_suffix "$2" "$3")
+            local fmt
+            if [ "$2" = "a" ]; then
+              fmt="bestaudio/best"
+            else
+              if [ "$3" = "max" ]; then fmt="bestvideo+bestaudio/best"
+              else fmt="bestvideo[height<=$3]+bestaudio/best[height<=$3]"; fi
+            fi
+            yt-dlp --force-ipv4 --retries 5 $COOKIE_ARGS \
+              --remote-components ejs:github \
+              --extractor-args "youtube:player_client=ios,tv,web_embedded" \
+              -f "$fmt" --merge-output-format mp4 \
+              -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1"
+          }
+
+          fallback_ytmp3_api() {
+            local type="$2" val="$3" FORMAT="mp4" QUALITY="720p"
+            if [ "$type" = "a" ]; then
+              FORMAT="mp3"; QUALITY="${val:-192}kbps"
+            else
+              QUALITY="${val:-720}p"
+            fi
+            local tmp_info=$(mktemp)
+            export TMP_INFO="$tmp_info" FB_URL="$1" FB_FMT="$FORMAT" FB_QUAL="$QUALITY"
+
+            if [ -f ".github/script/youtube-downloader-ytmp3gg.py" ]; then
+              python3 .github/script/youtube-downloader-ytmp3gg.py
+            elif [ -f ".github/scripts/youtube-downloader-ytmp3gg.py" ]; then
+              python3 .github/scripts/youtube-downloader-ytmp3gg.py
+            else
+              echo "❌ Python script not found"; return 1
+            fi
+
+            if [ ! -s "$tmp_info" ]; then return 1; fi
+            DL_URL=$(python3 -c \
+              "import json; print(json.load(open('$tmp_info'))['url'])")
+            FILENAME=$(python3 -c \
+              "import json; print(json.load(open('$tmp_info'))['filename'])")
+            curl -L --fail --progress-bar --retry 3 \
+              -o "$OUTPUT_FOLDER/$FILENAME" "$DL_URL"
+            rm -f "$tmp_info"
+          }
+
+          fallback_ytdlp_advanced() {
+            local suf=$(build_suffix "$2" "$3")
+            local fmt
+            if [ "$2" = "a" ]; then
+              fmt="bestaudio/best"
+            else
+              if [ "$3" = "max" ]; then fmt="bestvideo+bestaudio/best"
+              else fmt="bestvideo[height<=$3]+bestaudio/best[height<=$3]"; fi
+            fi
+            yt-dlp $COOKIE_ARGS \
+              --remote-components ejs:github \
+              --extractor-args "youtube:player_client=ios,web_music,tv,web_embedded" \
+              -f "$fmt" --merge-output-format mp4 \
+              -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1"
+          }
+
+          FALLBACKS=( fallback_piped fallback_force_ipv4 fallback_ytmp3_api fallback_ytdlp_advanced )
+
+          for ((idx=0; idx<count; idx++)); do
+            link=$(echo "$FAILED_ENTRIES" | jq -r ".[$idx].link")
+            type=$(echo "$FAILED_ENTRIES" | jq -r ".[$idx].type")
+            val=$(echo "$FAILED_ENTRIES" | jq -r ".[$idx].val")
+            echo "🔄 Fallback for: $link (type=$type, val=$val)"
+            for fb in "${FALLBACKS[@]}"; do
+              if $fb "$link" "$type" "$val"; then
+                echo "✅ Fallback ($fb) Succeeded!"; break
+              fi
+            done
+          done
+
+      - name: Force Push to Second Repository (Clear & Upload)
+        run: |
+          cd /tmp/downloaded_media
+
+          if [ -z "$(ls -A . 2>/dev/null)" ]; then
+            echo "❌ هیچ فایلی دانلود نشد؛ فرآیند آپلود متوقف شد."
+            exit 1
+          fi
+
+          mkdir -p /tmp/final_upload
+          for file in *; do
+            if [ -f "$file" ]; then
+              zip -0 -s 95m "/tmp/final_upload/${file}.zip" "$file"
+            fi
+          done
+
+          cd /tmp/final_upload
+          git init
+          git checkout -b main
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          git add .
+          git commit -m "Auto Upload From Downloader"
+          git remote add origin \
+            https://x-access-token:${{ secrets.SECOND_REPO_TOKEN }}@github.com/${{ github.repository_owner }}/my-files.git
+          git push --force origin main
+          
+      - name: Write job metadata signal
+        if: github.event.inputs.job_id != ''
+        run: |
+          JOB_ID="${{ github.event.inputs.job_id }}"
+          
+          cd /tmp/final_upload
+          echo "{\"job_id\":\"$JOB_ID\",\"status\":\"ready\"}" > job_meta.json
+          
+          git add job_meta.json
+          git commit --amend --no-edit
+          git push --force origin main

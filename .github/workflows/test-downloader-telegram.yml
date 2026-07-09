@@ -1,0 +1,100 @@
+name: test-downloader-telegram
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_links:
+        description: >
+          Telegram post links (max 50).
+          Separate by commas, spaces, or newlines.
+        required: true
+      job_id:
+        description: 'Job ID (set automatically by bot)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  actions:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 zip jq
+
+      - name: Resolve and download Telegram files
+        run: |
+          INPUT="${{ github.event.inputs.telegram_links }}"
+          URLS=$(echo "$INPUT" | tr ',' ' ' | tr '\n' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//')
+          if [ -z "$URLS" ]; then
+            echo "No links provided." >&2; exit 1
+          fi
+
+          mkdir -p /tmp/downloads
+          echo "$URLS" | tr ' ' '\n' > /tmp/links.txt
+
+          while IFS= read -r link; do
+            [ -z "$link" ] && continue
+            echo "Processing: $link"
+
+            RESOLVE=$(curl -s --max-time 20 -X POST "https://telegramdownloader.net/proxy.php" \
+              -d "telegram_link=$link" 2>/dev/null)
+
+            DL_URL=$(echo "$RESOLVE" | jq -r '.data.data.link   // empty' 2>/dev/null)
+            FILE_NAME=$(echo "$RESOLVE" | jq -r '.data.data.file_name // empty' 2>/dev/null)
+
+            if [ -z "$DL_URL" ] || [ -z "$FILE_NAME" ]; then
+              echo "Could not resolve: $link"
+              continue
+            fi
+
+            echo "Downloading: $FILE_NAME"
+            aria2c -x 16 -s 16 --console-log-level=warn \
+              -d /tmp/downloads -o "$FILE_NAME" "$DL_URL" \
+              || echo "Download failed for $FILE_NAME"
+          done < /tmp/links.txt
+
+          if [ -z "$(ls -A /tmp/downloads 2>/dev/null)" ]; then
+            echo "No files downloaded." >&2; exit 1
+          fi
+
+      - name: Zip and split files
+        run: |
+          mkdir -p /tmp/upload
+          RAND=$(openssl rand -hex 3)
+          ZIP_NAME="telegram_${RAND}.zip"
+          (cd /tmp/downloads && zip -0 -s 95m "/tmp/upload/$ZIP_NAME" *)
+          echo "Files in upload:"
+          ls -lh /tmp/upload/
+
+      - name: Checkout Repo2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/my-files
+          token: ${{ secrets.SECOND_REPO_TOKEN }}
+          path: repo2
+
+      - name: Force push to Repo2 with job_meta
+        run: |
+          JOB_ID="${{ github.event.inputs.job_id }}"
+          cd repo2
+
+          git checkout --orphan temp_branch 2>/dev/null || true
+          git rm -rf . 2>/dev/null || true
+
+          cp /tmp/upload/* ./
+
+          if [ -n "$JOB_ID" ]; then
+            echo "{\"job_id\":\"$JOB_ID\",\"status\":\"ready\"}" > job_meta.json
+          fi
+
+          git config user.name  "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "telegram:${JOB_ID:-manual}"
+          git branch -M main
+          git push --force origin main
