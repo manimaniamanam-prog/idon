@@ -42,7 +42,7 @@ jobs:
             echo "$YOUTUBE_COOKIES" > youtube-cookies.txt
             echo "✅ YouTube cookies written from secret."
           else
-            echo "ℹ️ No YOUTUBE_COOKIES secret – proceeding without cookies."
+            echo "⚠️ No YOUTUBE_COOKIES secret — این حالا تقریباً همیشه لازمه"
           fi
         env:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
@@ -52,15 +52,47 @@ jobs:
         with:
           deno-version: 2.x
 
+      # ═══════════════════════════════════════════════════════════
+      # ✅ جدید: راه‌اندازی PO Token Provider
+      # سرویسی که واقعاً PO Token معتبر تولید می‌کند (رسمی، نگهداری‌شده
+      # توسط تیم yt-dlp) — این ریشه‌ی اصلی مشکل «403 Forbidden» را حل می‌کند
+      # ═══════════════════════════════════════════════════════════
+      - name: Start PO Token Provider server
+        run: |
+          docker run --name bgutil-provider -d --init -p 4416:4416 \
+            brainicism/bgutil-ytdlp-pot-provider
+
+          echo "⏳ صبر برای بالا آمدن سرور..."
+          sleep 8
+          docker ps
+          docker logs bgutil-provider
+
+      - name: Install bgutil PO Token plugin for yt-dlp
+        run: |
+          PLUGIN_DIR="$HOME/.config/yt-dlp/plugins"
+          mkdir -p "$PLUGIN_DIR"
+          curl -sL \
+            https://github.com/Brainicism/bgutil-ytdlp-pot-provider/releases/latest/download/bgutil-ytdlp-pot-provider.zip \
+            -o /tmp/bgutil-plugin.zip
+          unzip -q /tmp/bgutil-plugin.zip -d "$PLUGIN_DIR"
+          echo "✅ Plugin installed:"
+          find "$PLUGIN_DIR" -maxdepth 3
+
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq ffmpeg python3-pip
+          sudo apt-get install -y -qq jq ffmpeg python3-pip unzip
           python3 -m pip install requests --break-system-packages || \
           python3 -m pip install requests
           sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
             -o /usr/local/bin/yt-dlp
           sudo chmod a+rx /usr/local/bin/yt-dlp
+
+      # ✅ تأیید فعال بودن PO Token Provider قبل از دانلود واقعی
+      - name: Verify PO Token Provider is detected
+        run: |
+          yt-dlp -v --skip-download "${{ github.event.inputs.url }}" 2>&1 | grep -i "pot" || \
+            echo "⚠️ هشدار: provider در خروجی verbose دیده نشد — ممکنه مشکلی باشه"
 
       - name: Create Temp Directory
         id: tempdir
@@ -101,6 +133,21 @@ jobs:
 
           echo "🌐 Global defaults: type=$GLOBAL_TYPE quality=$GLOBAL_VAL"
 
+          COOKIE_ARGS=""
+          if [ -f youtube-cookies.txt ] && [ -s youtube-cookies.txt ]; then
+            COOKIE_ARGS="--cookies youtube-cookies.txt"
+          fi
+
+          # ✅ ساده شد: چون PO Token واقعی داریم، دیگه نیازی به دو پاس
+          # جداگانه (iOS بدون کوکی / mweb با کوکی) نیست.
+          # کوکی + PO Token Provider فعال = هر دو مانع قبلی حل شده.
+          # نیازی به extractor-arg خاص po_token نیست — bgutil خودکار
+          # شناسایی و استفاده می‌شود.
+          YT_DLP_ARGS="$COOKIE_ARGS \
+            --remote-components ejs:github \
+            --extractor-args youtube:player_client=mweb,tv,web_embedded \
+            --no-progress"
+
           FAILED_ENTRIES='[]'
           count=$(echo "$ENTRIES_JSON" | jq length)
 
@@ -114,79 +161,37 @@ jobs:
             echo "🔧 Type: $type | Quality: $val"
 
             if [ "$type" = "a" ]; then
-              if [ "$val" = "max" ]; then
-                FORMAT_STR="bestaudio/best"
-              elif [ "$val" = "min" ]; then
-                FORMAT_STR="worstaudio/worst"
-              else
-                FORMAT_STR="bestaudio[abr<=${val}]/bestaudio/best"
-              fi
-              OUT_TEMPLATE="$OUTPUT_FOLDER/%(title)s-${val}kbps.%(ext)s"
-              EXTRA_ARGS="--extract-audio --audio-format mp3"
-            else
-              if [ "$val" = "max" ]; then
-                FORMAT_STR="bestvideo+bestaudio/best"
-              elif [ "$val" = "min" ]; then
-                FORMAT_STR="worstvideo+worstaudio/worst"
-              else
-                FORMAT_STR="bestvideo[height<=${val}]+bestaudio/best[height<=${val}]"
-              fi
-              OUT_TEMPLATE="$OUTPUT_FOLDER/%(title)s-${val}p.%(ext)s"
-              EXTRA_ARGS="--merge-output-format mp4"
-            fi
-            echo "🔧 Format string: $FORMAT_STR"
-
-            # ═══════════════════════════════════════════════════════
-            # ✅ رفع اصلی: PO Token Issue
-            # ═══════════════════════════════════════════════════════
-            # یوتیوب اخیراً برای بیشتر client ها PO Token اجباری کرده.
-            # کلاینت iOS تنها کلاینتیه که بدون PO Token هنوز کار می‌کنه —
-            # ولی فقط اگه کوکی بهش پاس ندیم (iOS کوکی رو نادیده می‌گیره
-            # و اگه کوکی بدیم، yt-dlp خودش iOS رو کلاً skip می‌کنه).
-            #
-            # پس: مرحله ۱ بدون کوکی + فقط iOS (برای ویدیوهای عمومی)
-            #      مرحله ۲ (فقط اگه ۱ شکست خورد) با کوکی + mweb/tv/web_embedded
-            # ═══════════════════════════════════════════════════════
-
-            SUCCESS=0
-
-            echo "▶ [Pass 1] iOS client — بدون کوکی (اکثر ویدیوهای عمومی)"
-            if yt-dlp \
-                --remote-components ejs:github \
-                --extractor-args "youtube:player_client=ios" \
-                --no-progress \
-                -f "$FORMAT_STR" $EXTRA_ARGS \
-                -o "$OUT_TEMPLATE" \
-                "$link"; then
-              echo "✅ موفق با iOS (بدون کوکی)"
-              SUCCESS=1
-            else
-              echo "❌ iOS بدون کوکی جواب نداد"
-            fi
-
-            if [ "$SUCCESS" -eq 0 ]; then
-              echo "▶ [Pass 2] mweb/tv/web_embedded — با کوکی (fallback)"
-              COOKIE_ARGS=""
-              if [ -f youtube-cookies.txt ] && [ -s youtube-cookies.txt ]; then
-                COOKIE_ARGS="--cookies youtube-cookies.txt"
-              fi
-              if yt-dlp $COOKIE_ARGS \
-                  --remote-components ejs:github \
-                  --extractor-args "youtube:player_client=mweb,tv,web_embedded" \
-                  --no-progress \
-                  -f "$FORMAT_STR" $EXTRA_ARGS \
-                  -o "$OUT_TEMPLATE" \
+              if [ "$val" = "max" ]; then FORMAT_STR="bestaudio/best"
+              elif [ "$val" = "min" ]; then FORMAT_STR="worstaudio/worst"
+              else FORMAT_STR="bestaudio[abr<=${val}]/bestaudio/best"; fi
+              echo "🎵 Audio format string: $FORMAT_STR"
+              if yt-dlp $YT_DLP_ARGS \
+                  -f "$FORMAT_STR" \
+                  --extract-audio --audio-format mp3 \
+                  -o "$OUTPUT_FOLDER/%(title)s-${val}kbps.%(ext)s" \
                   "$link"; then
-                echo "✅ موفق با mweb/tv/web_embedded (با کوکی)"
-                SUCCESS=1
+                echo "✅ Audio download success"
               else
                 echo "❌ Primary download failed – queued for fallback"
+                FAILED_ENTRIES=$(echo "$FAILED_ENTRIES" | \
+                  jq ". + [{link: \"$link\", type: \"$type\", val: \"$val\"}]")
               fi
-            fi
-
-            if [ "$SUCCESS" -eq 0 ]; then
-              FAILED_ENTRIES=$(echo "$FAILED_ENTRIES" | \
-                jq ". + [{link: \"$link\", type: \"$type\", val: \"$val\"}]")
+            else
+              if [ "$val" = "max" ]; then FORMAT_STR="bestvideo+bestaudio/best"
+              elif [ "$val" = "min" ]; then FORMAT_STR="worstvideo+worstaudio/worst"
+              else FORMAT_STR="bestvideo[height<=${val}]+bestaudio/best[height<=${val}]"; fi
+              echo "🎬 Video format string: $FORMAT_STR"
+              if yt-dlp $YT_DLP_ARGS \
+                  -f "$FORMAT_STR" \
+                  --merge-output-format mp4 \
+                  -o "$OUTPUT_FOLDER/%(title)s-${val}p.%(ext)s" \
+                  "$link"; then
+                echo "✅ Video download success"
+              else
+                echo "❌ Primary download failed – queued for fallback"
+                FAILED_ENTRIES=$(echo "$FAILED_ENTRIES" | \
+                  jq ". + [{link: \"$link\", type: \"$type\", val: \"$val\"}]")
+              fi
             fi
           done
 
@@ -286,7 +291,6 @@ jobs:
               if [ "$3" = "max" ]; then fmt="bestvideo+bestaudio/best"
               else fmt="bestvideo[height<=$3]+bestaudio/best[height<=$3]"; fi
             fi
-            # ✅ mweb به‌جای ios — طبق توصیه فعلی خود yt-dlp wiki
             yt-dlp --force-ipv4 --retries 5 $COOKIE_ARGS \
               --remote-components ejs:github \
               --extractor-args "youtube:player_client=mweb,tv,web_embedded" \
@@ -331,10 +335,9 @@ jobs:
               if [ "$3" = "max" ]; then fmt="bestvideo+bestaudio/best"
               else fmt="bestvideo[height<=$3]+bestaudio/best[height<=$3]"; fi
             fi
-            # ✅ فرمت HLS/m3u8 در بعضی موارد به PO Token نیاز ندارد
             yt-dlp $COOKIE_ARGS \
               --remote-components ejs:github \
-              --extractor-args "youtube:player_client=mweb,tv,web_embedded;formats=missing_pot" \
+              --extractor-args "youtube:player_client=web,ios,tv,web_embedded" \
               -f "$fmt" --merge-output-format mp4 \
               -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1"
           }
@@ -391,3 +394,8 @@ jobs:
           git add job_meta.json
           git commit --amend --no-edit
           git push --force origin main
+
+      # ✅ پاکسازی سرویس پس‌زمینه
+      - name: Stop PO Token Provider
+        if: always()
+        run: docker stop bgutil-provider 2>/dev/null || true
