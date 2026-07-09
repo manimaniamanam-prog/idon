@@ -47,7 +47,6 @@ jobs:
         env:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
 
-      # ✅ FIX 1: v1.x → 2.x  (حداقل نیاز yt-dlp/EJS = Deno 2.0.0)
       - name: Install Deno Runtime
         uses: denoland/setup-deno@v1
         with:
@@ -57,8 +56,6 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq ffmpeg python3-pip
-          # ✅ FIX 2: pip install yt-dlp-ejs حذف شد (بی‌اثر بود)
-          # چون yt-dlp را از binary نصب می‌کنیم، پکیج pip تأثیری ندارد
           python3 -m pip install requests --break-system-packages || \
           python3 -m pip install requests
           sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
@@ -104,20 +101,6 @@ jobs:
 
           echo "🌐 Global defaults: type=$GLOBAL_TYPE quality=$GLOBAL_VAL"
 
-          # ✅ FIX 3: از -s (non-empty) به جای -f (exists) برای چک کوکی
-          # بدون این، فایل خالی هم باعث skip شدن iOS client می‌شد
-          COOKIE_ARGS=""
-          if [ -f youtube-cookies.txt ] && [ -s youtube-cookies.txt ]; then
-            COOKIE_ARGS="--cookies youtube-cookies.txt"
-          fi
-
-          # ✅ FIX 4: --remote-components ejs:github جایگزین --js-runtimes deno شد
-          # این روش EJS را از GitHub دانلود می‌کند (همیشه به‌روز، با هر runtime کار می‌کند)
-          YT_DLP_ARGS="$COOKIE_ARGS \
-            --remote-components ejs:github \
-            --extractor-args youtube:player_client=ios,tv,web_embedded \
-            --no-progress"
-
           FAILED_ENTRIES='[]'
           count=$(echo "$ENTRIES_JSON" | jq length)
 
@@ -138,18 +121,8 @@ jobs:
               else
                 FORMAT_STR="bestaudio[abr<=${val}]/bestaudio/best"
               fi
-              echo "🎵 Audio format string: $FORMAT_STR"
-              if yt-dlp $YT_DLP_ARGS \
-                  -f "$FORMAT_STR" \
-                  --extract-audio --audio-format mp3 \
-                  -o "$OUTPUT_FOLDER/%(title)s-${val}kbps.%(ext)s" \
-                  "$link"; then
-                echo "✅ Audio download success"
-              else
-                echo "❌ Primary download failed – queued for fallback"
-                FAILED_ENTRIES=$(echo "$FAILED_ENTRIES" | \
-                  jq ". + [{link: \"$link\", type: \"$type\", val: \"$val\"}]")
-              fi
+              OUT_TEMPLATE="$OUTPUT_FOLDER/%(title)s-${val}kbps.%(ext)s"
+              EXTRA_ARGS="--extract-audio --audio-format mp3"
             else
               if [ "$val" = "max" ]; then
                 FORMAT_STR="bestvideo+bestaudio/best"
@@ -158,18 +131,62 @@ jobs:
               else
                 FORMAT_STR="bestvideo[height<=${val}]+bestaudio/best[height<=${val}]"
               fi
-              echo "🎬 Video format string: $FORMAT_STR"
-              if yt-dlp $YT_DLP_ARGS \
-                  -f "$FORMAT_STR" \
-                  --merge-output-format mp4 \
-                  -o "$OUTPUT_FOLDER/%(title)s-${val}p.%(ext)s" \
+              OUT_TEMPLATE="$OUTPUT_FOLDER/%(title)s-${val}p.%(ext)s"
+              EXTRA_ARGS="--merge-output-format mp4"
+            fi
+            echo "🔧 Format string: $FORMAT_STR"
+
+            # ═══════════════════════════════════════════════════════
+            # ✅ رفع اصلی: PO Token Issue
+            # ═══════════════════════════════════════════════════════
+            # یوتیوب اخیراً برای بیشتر client ها PO Token اجباری کرده.
+            # کلاینت iOS تنها کلاینتیه که بدون PO Token هنوز کار می‌کنه —
+            # ولی فقط اگه کوکی بهش پاس ندیم (iOS کوکی رو نادیده می‌گیره
+            # و اگه کوکی بدیم، yt-dlp خودش iOS رو کلاً skip می‌کنه).
+            #
+            # پس: مرحله ۱ بدون کوکی + فقط iOS (برای ویدیوهای عمومی)
+            #      مرحله ۲ (فقط اگه ۱ شکست خورد) با کوکی + mweb/tv/web_embedded
+            # ═══════════════════════════════════════════════════════
+
+            SUCCESS=0
+
+            echo "▶ [Pass 1] iOS client — بدون کوکی (اکثر ویدیوهای عمومی)"
+            if yt-dlp \
+                --remote-components ejs:github \
+                --extractor-args "youtube:player_client=ios" \
+                --no-progress \
+                -f "$FORMAT_STR" $EXTRA_ARGS \
+                -o "$OUT_TEMPLATE" \
+                "$link"; then
+              echo "✅ موفق با iOS (بدون کوکی)"
+              SUCCESS=1
+            else
+              echo "❌ iOS بدون کوکی جواب نداد"
+            fi
+
+            if [ "$SUCCESS" -eq 0 ]; then
+              echo "▶ [Pass 2] mweb/tv/web_embedded — با کوکی (fallback)"
+              COOKIE_ARGS=""
+              if [ -f youtube-cookies.txt ] && [ -s youtube-cookies.txt ]; then
+                COOKIE_ARGS="--cookies youtube-cookies.txt"
+              fi
+              if yt-dlp $COOKIE_ARGS \
+                  --remote-components ejs:github \
+                  --extractor-args "youtube:player_client=mweb,tv,web_embedded" \
+                  --no-progress \
+                  -f "$FORMAT_STR" $EXTRA_ARGS \
+                  -o "$OUT_TEMPLATE" \
                   "$link"; then
-                echo "✅ Video download success"
+                echo "✅ موفق با mweb/tv/web_embedded (با کوکی)"
+                SUCCESS=1
               else
                 echo "❌ Primary download failed – queued for fallback"
-                FAILED_ENTRIES=$(echo "$FAILED_ENTRIES" | \
-                  jq ". + [{link: \"$link\", type: \"$type\", val: \"$val\"}]")
               fi
+            fi
+
+            if [ "$SUCCESS" -eq 0 ]; then
+              FAILED_ENTRIES=$(echo "$FAILED_ENTRIES" | \
+                jq ". + [{link: \"$link\", type: \"$type\", val: \"$val\"}]")
             fi
           done
 
@@ -269,9 +286,10 @@ jobs:
               if [ "$3" = "max" ]; then fmt="bestvideo+bestaudio/best"
               else fmt="bestvideo[height<=$3]+bestaudio/best[height<=$3]"; fi
             fi
+            # ✅ mweb به‌جای ios — طبق توصیه فعلی خود yt-dlp wiki
             yt-dlp --force-ipv4 --retries 5 $COOKIE_ARGS \
               --remote-components ejs:github \
-              --extractor-args "youtube:player_client=ios,tv,web_embedded" \
+              --extractor-args "youtube:player_client=mweb,tv,web_embedded" \
               -f "$fmt" --merge-output-format mp4 \
               -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1"
           }
@@ -313,9 +331,10 @@ jobs:
               if [ "$3" = "max" ]; then fmt="bestvideo+bestaudio/best"
               else fmt="bestvideo[height<=$3]+bestaudio/best[height<=$3]"; fi
             fi
+            # ✅ فرمت HLS/m3u8 در بعضی موارد به PO Token نیاز ندارد
             yt-dlp $COOKIE_ARGS \
               --remote-components ejs:github \
-              --extractor-args "youtube:player_client=ios,web_music,tv,web_embedded" \
+              --extractor-args "youtube:player_client=mweb,tv,web_embedded;formats=missing_pot" \
               -f "$fmt" --merge-output-format mp4 \
               -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1"
           }
@@ -360,15 +379,15 @@ jobs:
           git remote add origin \
             https://x-access-token:${{ secrets.SECOND_REPO_TOKEN }}@github.com/${{ github.repository_owner }}/my-files.git
           git push --force origin main
-          
+
       - name: Write job metadata signal
         if: github.event.inputs.job_id != ''
         run: |
           JOB_ID="${{ github.event.inputs.job_id }}"
-          
+
           cd /tmp/final_upload
           echo "{\"job_id\":\"$JOB_ID\",\"status\":\"ready\"}" > job_meta.json
-          
+
           git add job_meta.json
           git commit --amend --no-edit
           git push --force origin main
