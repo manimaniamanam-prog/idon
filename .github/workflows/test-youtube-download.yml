@@ -69,19 +69,20 @@ jobs:
 
       - name: Install bgutil PO Token plugin for yt-dlp
         run: |
+          # ✅ رفع باگ: طبق مستندات رسمی، باید خود فایل zip (بدون extract)
+          # مستقیماً در پوشه‌ی plugin قرار بگیره — yt-dlp خودش zip رو می‌خونه
           PLUGIN_DIR="$HOME/.config/yt-dlp/plugins"
           mkdir -p "$PLUGIN_DIR"
           curl -sL \
             https://github.com/Brainicism/bgutil-ytdlp-pot-provider/releases/latest/download/bgutil-ytdlp-pot-provider.zip \
-            -o /tmp/bgutil-plugin.zip
-          unzip -q /tmp/bgutil-plugin.zip -d "$PLUGIN_DIR"
-          echo "✅ Plugin installed:"
-          find "$PLUGIN_DIR" -maxdepth 3
+            -o "$PLUGIN_DIR/bgutil-ytdlp-pot-provider.zip"
+          echo "✅ Plugin zip placed at:"
+          ls -la "$PLUGIN_DIR"
 
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq ffmpeg python3-pip unzip
+          sudo apt-get install -y -qq jq ffmpeg python3-pip
           python3 -m pip install requests --break-system-packages || \
           python3 -m pip install requests
           sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
