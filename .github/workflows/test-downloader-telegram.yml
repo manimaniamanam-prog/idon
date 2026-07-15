@@ -43,6 +43,7 @@ jobs:
           import sys
           from telethon.sync import TelegramClient
           from telethon.sessions import StringSession
+          from telethon.tl.functions.stories import GetStoriesByIDRequest
 
           api_id     = int(os.environ["TG_API_ID"])
           api_hash   = os.environ["TG_API_HASH"]
@@ -50,7 +51,6 @@ jobs:
           raw_links  = os.environ["TG_LINKS"]
           out_dir    = "/tmp/downloads"
 
-          # پارس لینک‌ها (کاما، فاصله، خط جدید)
           links = re.split(r'[,\s]+', raw_links.strip())
           links = [l for l in links if l]
 
@@ -60,25 +60,31 @@ jobs:
 
           def parse_link(link: str):
               """
-              برمی‌گرداند (chat_identifier, message_id)
-              پشتیبانی از:
-                t.me/channelname/123        -> ('channelname', 123)
-                t.me/c/1234567890/123       -> (-100 + 1234567890, 123)  [کانال خصوصی]
+              برمی‌گرداند یکی از این حالت‌ها:
+                ("story", username, story_id)          -> لینک استوری
+                ("private", chat_id, message_id)        -> کانال خصوصی
+                ("public", username_or_id, message_id)  -> پست معمولی
+                (None, None, None)                      -> تشخیص داده نشد
               """
-              m = re.search(r't\.me/c/(\d+)/(\d+)', link)
+              # ✅ جدید: لینک استوری — هم t.me هم telegram.me
+              m = re.search(r'(?:t\.me|telegram\.me)/([^/]+)/s/(\d+)', link)
+              if m:
+                  return "story", m.group(1), int(m.group(2))
+
+              # کانال خصوصی: t.me/c/1234567890/123
+              m = re.search(r'(?:t\.me|telegram\.me)/c/(\d+)/(\d+)', link)
               if m:
                   internal_id = int(m.group(1))
                   msg_id = int(m.group(2))
                   chat_id = int(f"-100{internal_id}")
-                  return chat_id, msg_id
+                  return "private", chat_id, msg_id
 
-              m = re.search(r't\.me/([^/]+)/(\d+)', link)
+              # پست معمولی: t.me/channelname/123
+              m = re.search(r'(?:t\.me|telegram\.me)/([^/]+)/(\d+)', link)
               if m:
-                  username = m.group(1)
-                  msg_id = int(m.group(2))
-                  return username, msg_id
+                  return "public", m.group(1), int(m.group(2))
 
-              return None, None
+              return None, None, None
 
           success_count = 0
 
@@ -90,19 +96,35 @@ jobs:
                   print(f"────────────────────────────────")
                   print(f"Processing: {link}")
 
-                  chat_id, msg_id = parse_link(link)
-                  if chat_id is None:
+                  kind, ident, item_id = parse_link(link)
+                  if kind is None:
                       print(f"⚠️ Could not parse link: {link}")
                       continue
 
                   try:
-                      message = client.get_messages(chat_id, ids=msg_id)
-                      if not message or not message.media:
-                          print(f"⚠️ No media found in message: {link}")
-                          continue
+                      if kind == "story":
+                          # ✅ استوری با API جدا گرفته می‌شود
+                          result = client(GetStoriesByIDRequest(peer=ident, id=[item_id]))
+                          if not result.stories:
+                              print(f"⚠️ استوری پیدا نشد — یا منقضی شده یا حریم‌خصوصی محدودش کرده")
+                              print(f"   (فقط مخاطبین یا استوری‌های عمومی قابل‌دسترسی هستند)")
+                              continue
+                          story = result.stories[0]
+                          if not story.media:
+                              print(f"⚠️ این استوری رسانه ندارد (شاید فقط متن است)")
+                              continue
+                          print(f"⬇️ Downloading story...")
+                          path = client.download_media(story, file=out_dir + "/")
 
-                      print(f"⬇️ Downloading...")
-                      path = client.download_media(message, file=out_dir + "/")
+                      else:
+                          chat_id = ident
+                          message = client.get_messages(chat_id, ids=item_id)
+                          if not message or not message.media:
+                              print(f"⚠️ No media found in message: {link}")
+                              continue
+                          print(f"⬇️ Downloading...")
+                          path = client.download_media(message, file=out_dir + "/")
+
                       if path:
                           print(f"✅ Downloaded: {path}")
                           success_count += 1
