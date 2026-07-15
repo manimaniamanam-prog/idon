@@ -6,7 +6,10 @@ on:
       telegram_links:
         description: >
           لینک(های) تلگرام. جدا با کاما، فاصله یا خط جدید.
-          فرمت‌های معتبر: t.me/channel/123  یا  t.me/c/1234567890/123
+          فرمت‌های معتبر:
+            t.me/channel/123
+            t.me/c/1234567890/123
+            t.me/username/s/42   (استوری)
         required: true
       job_id:
         description: 'Job ID (set automatically by bot)'
@@ -60,18 +63,16 @@ jobs:
 
           def parse_link(link: str):
               """
-              برمی‌گرداند یکی از این حالت‌ها:
-                ("story", username, story_id)          -> لینک استوری
-                ("private", chat_id, message_id)        -> کانال خصوصی
-                ("public", username_or_id, message_id)  -> پست معمولی
-                (None, None, None)                      -> تشخیص داده نشد
+              برمی‌گرداند:
+                ("story",   username, story_id)
+                ("private", chat_id,  message_id)
+                ("public",  username, message_id)
+                (None, None, None)
               """
-              # ✅ جدید: لینک استوری — هم t.me هم telegram.me
               m = re.search(r'(?:t\.me|telegram\.me)/([^/]+)/s/(\d+)', link)
               if m:
                   return "story", m.group(1), int(m.group(2))
 
-              # کانال خصوصی: t.me/c/1234567890/123
               m = re.search(r'(?:t\.me|telegram\.me)/c/(\d+)/(\d+)', link)
               if m:
                   internal_id = int(m.group(1))
@@ -79,7 +80,6 @@ jobs:
                   chat_id = int(f"-100{internal_id}")
                   return "private", chat_id, msg_id
 
-              # پست معمولی: t.me/channelname/123
               m = re.search(r'(?:t\.me|telegram\.me)/([^/]+)/(\d+)', link)
               if m:
                   return "public", m.group(1), int(m.group(2))
@@ -103,7 +103,6 @@ jobs:
 
                   try:
                       if kind == "story":
-                          # ✅ استوری با API جدا گرفته می‌شود
                           result = client(GetStoriesByIDRequest(peer=ident, id=[item_id]))
                           if not result.stories:
                               print(f"⚠️ استوری پیدا نشد — یا منقضی شده یا حریم‌خصوصی محدودش کرده")
@@ -113,8 +112,35 @@ jobs:
                           if not story.media:
                               print(f"⚠️ این استوری رسانه ندارد (شاید فقط متن است)")
                               continue
+
                           print(f"⬇️ Downloading story...")
-                          path = client.download_media(story, file=out_dir + "/")
+                          path = None
+
+                          # روش ۱: خود media مستقیم
+                          try:
+                              path = client.download_media(story.media, file=out_dir + "/")
+                          except Exception as e1:
+                              print(f"   [روش ۱ ناموفق: {e1}]")
+
+                          # روش ۲: زیرمجموعه‌ی photo/document در media
+                          if not path:
+                              try:
+                                  sub_media = getattr(story.media, "photo", None) or \
+                                              getattr(story.media, "document", None)
+                                  if sub_media:
+                                      path = client.download_media(sub_media, file=out_dir + "/")
+                              except Exception as e2:
+                                  print(f"   [روش ۲ ناموفق: {e2}]")
+
+                          # روش ۳: کل شیء story
+                          if not path:
+                              try:
+                                  path = client.download_media(story, file=out_dir + "/")
+                              except Exception as e3:
+                                  print(f"   [روش ۳ ناموفق: {e3}]")
+
+                          if not path:
+                              print(f"❌ هر ۳ روش دانلود استوری ناموفق بود")
 
                       else:
                           chat_id = ident
