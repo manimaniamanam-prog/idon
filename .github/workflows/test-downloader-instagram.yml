@@ -19,63 +19,145 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ── ۱. نصب ابزارها ──────────────────────────────────────────
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq ffmpeg zip python3-pip
-          pip3 install --quiet gallery-dl
+          sudo apt-get install -y -qq jq ffmpeg zip python3-pip curl
 
-      - name: Write cookies (if available)
+          # ✅ نصب با --upgrade تا مطمئن باشیم آخرین نسخه‌ی gallery-dl هست
+          pip3 install --quiet --upgrade gallery-dl
+          echo "gallery-dl version:"
+          gallery-dl --version
+
+          # ✅ نصب yt-dlp هم به‌عنوان fallback (کد متفاوتی از gallery-dl داره)
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+            -o /usr/local/bin/yt-dlp
+          sudo chmod +x /usr/local/bin/yt-dlp
+          echo "yt-dlp version:"
+          yt-dlp --version
+
+      # ── ۲. نوشتن کوکی از secret ──────────────────────────────────
+      - name: Write cookies from secret
         run: |
           if [ -n "$INSTAGRAM_COOKIES" ]; then
             echo "$INSTAGRAM_COOKIES" > instagram-cookies.txt
-            echo "Cookies written."
+            echo "✅ Instagram cookies written."
+          else
+            echo "⚠️ No INSTAGRAM_COOKIES secret found — اینستاگرام تقریباً برای همه‌ی محتوا لاگین می‌خواد"
           fi
         env:
           INSTAGRAM_COOKIES: ${{ secrets.INSTAGRAM_COOKIES }}
 
-      - name: Parse Instagram URLs
+      # ── ۳. پارس لینک‌ها ──────────────────────────────────────────
+      - name: Parse input and extract URLs
+        id: parse
         run: |
           INPUT="${{ github.event.inputs.urls }}"
-          CLEANED=$(echo "$INPUT" | tr -d "\"'")
-          echo "$CLEANED" | grep -oP 'https?://(www\.)?instagram\.com/[^\s,;]+' \
-            | sort -u > /tmp/urls.txt
-          if [ ! -s /tmp/urls.txt ]; then
-            echo "No valid Instagram URLs." >&2; exit 1
+          CLEANED=$(echo "$INPUT" | tr -d '"'\')
+          URLS=$(echo "$CLEANED" | grep -oP 'https?://(www\.)?instagram\.com/[^\s,;]+' | sort -u)
+          if [ -z "$URLS" ]; then
+            echo "::error::No Instagram URLs found in the input."
+            exit 1
           fi
-          echo "URLs to download:"
+          echo "$URLS" > /tmp/urls.txt
+          echo "Found $(wc -l < /tmp/urls.txt) URL(s) to download."
           cat /tmp/urls.txt
 
+      # ── ۴. دانلود — اول gallery-dl، بعد yt-dlp به‌عنوان fallback ──
       - name: Download Instagram content
         run: |
           mkdir -p /tmp/ig_downloads
+
           GALLERY_ARGS=""
           [ -f instagram-cookies.txt ] && GALLERY_ARGS="--cookies instagram-cookies.txt"
 
+          YTDLP_ARGS=""
+          [ -f instagram-cookies.txt ] && YTDLP_ARGS="--cookies instagram-cookies.txt"
+
+          FAILED_FILE="/tmp/failed_links.txt"
+          > "$FAILED_FILE"
+
           while IFS= read -r url; do
             [ -z "$url" ] && continue
-            echo "Downloading: $url"
+            echo "────────────────────────────────"
+            echo "Processing: $url"
+
+            BEFORE=$(find /tmp/ig_downloads -type f 2>/dev/null | wc -l)
+            success=0
+
+            # ── تلاش اول: gallery-dl (۳ بار) ──────────────────────
             for attempt in 1 2 3; do
-              gallery-dl $GALLERY_ARGS -d /tmp/ig_downloads "$url" --no-part \
-                && break || sleep 30
+              echo "  [gallery-dl] Attempt $attempt/3..."
+              gallery-dl $GALLERY_ARGS -d /tmp/ig_downloads "$url" --no-part && {
+                AFTER=$(find /tmp/ig_downloads -type f 2>/dev/null | wc -l)
+                if [ "$AFTER" -gt "$BEFORE" ]; then
+                  success=1
+                  echo "  ✅ gallery-dl succeeded"
+                  break
+                fi
+              }
+              sleep 10
             done
+
+            # ── fallback: yt-dlp (اگه gallery-dl کامل شکست خورد) ──
+            if [ "$success" -eq 0 ]; then
+              echo "  ⚠️ gallery-dl failed — trying yt-dlp fallback..."
+              yt-dlp $YTDLP_ARGS \
+                --no-playlist \
+                -o "/tmp/ig_downloads/%(uploader)s_%(id)s.%(ext)s" \
+                "$url" && {
+                AFTER=$(find /tmp/ig_downloads -type f 2>/dev/null | wc -l)
+                if [ "$AFTER" -gt "$BEFORE" ]; then
+                  success=1
+                  echo "  ✅ yt-dlp fallback succeeded"
+                fi
+              }
+            fi
+
+            if [ "$success" -eq 0 ]; then
+              echo "$url" >> "$FAILED_FILE"
+              echo "  ❌ Both gallery-dl and yt-dlp failed for: $url"
+            fi
           done < /tmp/urls.txt
 
-          if [ -z "$(find /tmp/ig_downloads -type f 2>/dev/null)" ]; then
-            echo "No files downloaded." >&2; exit 1
-          fi
-          echo "Downloaded files:"
-          find /tmp/ig_downloads -type f | head -20
+          echo "────────────────────────────────"
+          echo "Downloads finished."
+          find /tmp/ig_downloads -type f 2>/dev/null
 
-      - name: Archive files
+          if [ -s "$FAILED_FILE" ]; then
+            echo "::warning::Failed links:"
+            cat "$FAILED_FILE"
+          fi
+
+          if [ -z "$(find /tmp/ig_downloads -type f 2>/dev/null)" ]; then
+            echo "::error::No files downloaded with either gallery-dl or yt-dlp."
+            echo "::error::اگه هر دو ابزار fail شدن، احتمالاً کوکی منقضی شده یا پست خصوصیه."
+            exit 1
+          fi
+
+      # ── ۵. فشرده‌سازی ───────────────────────────────────────────
+      - name: Archive Instagram downloads
         run: |
           mkdir -p /tmp/upload
           RAND=$(openssl rand -hex 3)
           ZIP_NAME="instagram_${RAND}.zip"
-          (cd /tmp/ig_downloads && find . -type f | zip -0 -s 95m "/tmp/upload/$ZIP_NAME" -@)
+
+          cd /tmp/ig_downloads
+          FILE_LIST=$(find . -type f)
+          [ -f /tmp/failed_links.txt ] && [ -s /tmp/failed_links.txt ] && cp /tmp/failed_links.txt ./failed_links.txt
+          zip -0 -s 95m "/tmp/upload/$ZIP_NAME" $(find . -type f -printf '%P\n')
+
           echo "Archive:"
           ls -lh /tmp/upload/
 
+          if [ -z "$(ls -A /tmp/upload 2>/dev/null)" ]; then
+            echo "::error::Archive empty"
+            exit 1
+          fi
+          echo "✅ Archive ready"
+
+      # ── ۶. چک‌اوت Repo2 ─────────────────────────────────────────
       - name: Checkout Repo2
         uses: actions/checkout@v4
         with:
@@ -83,27 +165,26 @@ jobs:
           token: ${{ secrets.SECOND_REPO_TOKEN }}
           path: repo2
 
+      # ── ۷. Force push ─────────────────────────────────────────────
       - name: Force push to Repo2 with job_meta
         run: |
           JOB_ID="${{ github.event.inputs.job_id }}"
           cd repo2
-
           git checkout --orphan temp_branch 2>/dev/null || true
           git rm -rf . 2>/dev/null || true
-
           cp /tmp/upload/* ./
-
           if [ -n "$JOB_ID" ]; then
             echo "{\"job_id\":\"$JOB_ID\",\"status\":\"ready\"}" > job_meta.json
           fi
-
           git config user.name  "GitHub Actions"
           git config user.email "actions@github.com"
           git add .
           git commit -m "instagram:${JOB_ID:-manual}"
           git branch -M main
           git push --force origin main
+          echo "✅ Done"
 
+      # ── پاکسازی ───────────────────────────────────────────────────
       - name: Cleanup
         if: always()
-        run: rm -rf /tmp/ig_downloads instagram-cookies.txt 2>/dev/null || true
+        run: rm -rf /tmp/ig_downloads instagram-cookies.txt /tmp/urls.txt /tmp/failed_links.txt 2>/dev/null || true
