@@ -1,0 +1,209 @@
+name: test-downloader-spotify
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Spotify track, album, or playlist URL'
+        required: true
+        type: string
+      job_id:
+        description: 'Job ID (set automatically by bot)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── ۱. نصب Deno ──────────────────────────────────────────────
+      - name: Install Deno Runtime
+        uses: denoland/setup-deno@v1
+        with:
+          deno-version: 2.x
+
+      # ── ۲. راه‌اندازی PO Token Provider (همون روشی که یوتیوب رو حل کرد) ──
+      - name: Start PO Token Provider server
+        run: |
+          docker run --name bgutil-provider -d --init -p 4416:4416 \
+            brainicism/bgutil-ytdlp-pot-provider
+          echo "⏳ صبر برای بالا آمدن سرور..."
+          sleep 8
+          docker ps
+
+      - name: Install bgutil PO Token plugin for yt-dlp
+        run: |
+          # ✅ خود فایل zip بدون extract در پوشه plugin قرار می‌گیرد
+          PLUGIN_DIR="$HOME/.config/yt-dlp/plugins"
+          mkdir -p "$PLUGIN_DIR"
+          curl -sL \
+            https://github.com/Brainicism/bgutil-ytdlp-pot-provider/releases/latest/download/bgutil-ytdlp-pot-provider.zip \
+            -o "$PLUGIN_DIR/bgutil-ytdlp-pot-provider.zip"
+          echo "✅ Plugin placed:"
+          ls -la "$PLUGIN_DIR"
+
+      # ── ۳. نصب ابزارها ──────────────────────────────────────────
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq ffmpeg zip python3-pip curl
+
+          echo "Installing spotdl..."
+          pip3 install --quiet --upgrade spotdl
+          spotdl --version
+
+      # ── ۴. آماده‌سازی کوکی‌های یوتیوب ────────────────────────────
+      - name: '🔐 Prepare cookies'
+        run: |
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            echo "$YOUTUBE_COOKIES" > youtube-cookies.txt
+            echo "✅ YouTube cookies written from secret."
+          else
+            echo "⚠️ No YOUTUBE_COOKIES secret — الان تقریباً همیشه لازمه"
+          fi
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+
+      # ✅ تأیید فعال بودن provider
+      - name: Verify PO Token Provider is detected
+        run: |
+          python3 -c "
+          import yt_dlp
+          ydl = yt_dlp.YoutubeDL({'verbose': True, 'skip_download': True, 'simulate': True})
+          " 2>&1 | grep -i "pot" || echo "⚠️ provider در خروجی دیده نشد"
+
+      # ── ۵. مرحله اول: جستجوی دقیق (youtube-music + youtube) ────────
+      - name: Download from Spotify (Strict Match Pass)
+        id: strict_pass
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          mkdir -p /tmp/downloads
+
+          success=0
+          PROVIDERS=("youtube-music" "youtube")
+
+          for provider in "${PROVIDERS[@]}"; do
+            echo "▶ [Strict] Trying provider: $provider"
+            BEFORE=$(find /tmp/downloads -type f 2>/dev/null | wc -l)
+
+            COOKIE_ARG=""
+            if [ -f youtube-cookies.txt ] && [ -s youtube-cookies.txt ]; then
+              COOKIE_ARG="--cookie-file youtube-cookies.txt"
+            fi
+
+            spotdl "$URL" \
+              --audio "$provider" \
+              --format mp3 \
+              --bitrate 320k \
+              $COOKIE_ARG \
+              --yt-dlp-args "--remote-components ejs:github --extractor-args youtube:player_client=mweb,tv,web_embedded" \
+              --output "/tmp/downloads/{title} - {artists}.{output-ext}" || true
+
+            AFTER=$(find /tmp/downloads -type f 2>/dev/null | wc -l)
+            if [ "$AFTER" -gt "$BEFORE" ]; then
+              echo "✅ موفق (دقیق) با $provider"
+              success=1
+              break
+            fi
+            echo "❌ $provider نتیجه دقیق نداد"
+          done
+
+          echo "success=$success" >> $GITHUB_OUTPUT
+
+      # ── ۶. مرحله دوم: فقط اگه مرحله اول شکست خورد ──────────────────
+      - name: Download from Spotify (Loose Match Fallback)
+        if: steps.strict_pass.outputs.success == '0'
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          mkdir -p /tmp/downloads
+          echo "⚠️ هیچ تطابق دقیقی پیدا نشد — تلاش با فیلتر شل‌تر"
+
+          success=0
+          for provider in "youtube-music" "youtube"; do
+            echo "▶ [Loose] Trying provider: $provider"
+            BEFORE=$(find /tmp/downloads -type f 2>/dev/null | wc -l)
+
+            COOKIE_ARG=""
+            if [ -f youtube-cookies.txt ] && [ -s youtube-cookies.txt ]; then
+              COOKIE_ARG="--cookie-file youtube-cookies.txt"
+            fi
+
+            spotdl "$URL" \
+              --audio "$provider" \
+              --dont-filter-results \
+              --format mp3 \
+              --bitrate 320k \
+              $COOKIE_ARG \
+              --yt-dlp-args "--remote-components ejs:github --extractor-args youtube:player_client=mweb,tv,web_embedded" \
+              --output "/tmp/downloads/{title} - {artists} [loose-match].{output-ext}" || true
+
+            AFTER=$(find /tmp/downloads -type f 2>/dev/null | wc -l)
+            if [ "$AFTER" -gt "$BEFORE" ]; then
+              echo "✅ موفق (شل) با $provider"
+              success=1
+              break
+            fi
+          done
+
+          [ "$success" -eq 0 ] && echo "::error::حتی با فیلتر شل هم چیزی پیدا نشد"
+
+      # ── ۷. اعتبارسنجی نهایی ─────────────────────────────────────
+      - name: Validate final result
+        run: |
+          echo "Downloaded files:"
+          ls -lh /tmp/downloads/ 2>/dev/null || echo "(empty)"
+          if [ -z "$(find /tmp/downloads -type f 2>/dev/null)" ]; then
+            echo "::error::Download failed from ALL providers (strict + loose)"
+            exit 1
+          fi
+          echo "✅ Download successful"
+
+      # ── ۸. فشرده‌سازی ───────────────────────────────────────────
+      - name: Archive audio files
+        run: |
+          mkdir -p /tmp/upload
+          RAND=$(openssl rand -hex 3)
+          FNAME=$(ls -1 /tmp/downloads | head -1)
+          SAFE_NAME=$(echo "$FNAME" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g')
+          ZIP_NAME="${SAFE_NAME%.*}_${RAND}.zip"
+          (cd /tmp/downloads && zip -0 -s 95m "/tmp/upload/$ZIP_NAME" *)
+          if [ -z "$(ls -A /tmp/upload 2>/dev/null)" ]; then
+            echo "::error::Archive empty"
+            exit 1
+          fi
+          echo "✅ Archive ready"
+
+      # ── ۹. چک‌اوت Repo2 ─────────────────────────────────────────
+      - name: Checkout Repo2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/my-files
+          token: ${{ secrets.SECOND_REPO_TOKEN }}
+          path: repo2
+
+      # ── ۱۰. Force push ─────────────────────────────────────────────
+      - name: Force push to Repo2 with job_meta
+        run: |
+          JOB_ID="${{ github.event.inputs.job_id }}"
+          cd repo2
+          git checkout --orphan temp_branch 2>/dev/null || true
+          git rm -rf . 2>/dev/null || true
+          cp /tmp/upload/* ./
+          if [ -n "$JOB_ID" ]; then
+            echo "{\"job_id\":\"$JOB_ID\",\"status\":\"ready\"}" > job_meta.json
+          fi
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "spotify:${JOB_ID:-manual}"
+          git branch -M main
+          git push --force origin main
+          echo "✅ Done"
+
+      - name: Stop PO Token Provider
+        if: always()
+        run: docker stop bgutil-provider 2>/dev/null || true
