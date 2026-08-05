@@ -26,7 +26,7 @@ jobs:
         with:
           deno-version: 2.x
 
-      # ── ۲. راه‌اندازی PO Token Provider (همون روشی که یوتیوب رو حل کرد) ──
+      # ── ۲. راه‌اندازی PO Token Provider ──────────────────────────
       - name: Start PO Token Provider server
         run: |
           docker run --name bgutil-provider -d --init -p 4416:4416 \
@@ -34,10 +34,10 @@ jobs:
           echo "⏳ صبر برای بالا آمدن سرور..."
           sleep 8
           docker ps
+          docker logs bgutil-provider
 
       - name: Install bgutil PO Token plugin for yt-dlp
         run: |
-          # ✅ خود فایل zip بدون extract در پوشه plugin قرار می‌گیرد
           PLUGIN_DIR="$HOME/.config/yt-dlp/plugins"
           mkdir -p "$PLUGIN_DIR"
           curl -sL \
@@ -54,6 +54,15 @@ jobs:
 
           echo "Installing spotdl..."
           pip3 install --quiet --upgrade spotdl
+
+          # ✅ رفع تفاوت اصلی با اکشن یوتیوب: نسخه‌ی yt-dlp که spotdl
+          # خودش میاره ممکنه با hook پلاگین bgutil سازگار نباشه.
+          # چون این‌بار bgutil واقعاً نصبه (برخلاف تلاش قبلی که این
+          # آپدیت باعث regression شد)، این‌بار باید درست کار کنه.
+          echo "Force-upgrading yt-dlp (python package) for plugin compatibility..."
+          pip3 install --quiet --upgrade yt-dlp
+
+          python3 -c "import yt_dlp; print('yt-dlp version:', yt_dlp.version.__version__)"
           spotdl --version
 
       # ── ۴. آماده‌سازی کوکی‌های یوتیوب ────────────────────────────
@@ -63,20 +72,12 @@ jobs:
             echo "$YOUTUBE_COOKIES" > youtube-cookies.txt
             echo "✅ YouTube cookies written from secret."
           else
-            echo "⚠️ No YOUTUBE_COOKIES secret — الان تقریباً همیشه لازمه"
+            echo "⚠️ No YOUTUBE_COOKIES secret"
           fi
         env:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
 
-      # ✅ تأیید فعال بودن provider
-      - name: Verify PO Token Provider is detected
-        run: |
-          python3 -c "
-          import yt_dlp
-          ydl = yt_dlp.YoutubeDL({'verbose': True, 'skip_download': True, 'simulate': True})
-          " 2>&1 | grep -i "pot" || echo "⚠️ provider در خروجی دیده نشد"
-
-      # ── ۵. مرحله اول: جستجوی دقیق (youtube-music + youtube) ────────
+      # ── ۵. مرحله اول: جستجوی دقیق (با لاگ کامل برای تشخیص واقعی) ──
       - name: Download from Spotify (Strict Match Pass)
         id: strict_pass
         run: |
@@ -95,13 +96,17 @@ jobs:
               COOKIE_ARG="--cookie-file youtube-cookies.txt"
             fi
 
+            # ✅ --log-level DEBUG اضافه شد — این‌بار می‌بینیم provider
+            # واقعاً موقع دانلود فعاله یا نه (نه یه چک جدا و گمراه‌کننده)
             spotdl "$URL" \
               --audio "$provider" \
               --format mp3 \
               --bitrate 320k \
+              --log-level DEBUG \
               $COOKIE_ARG \
               --yt-dlp-args "--remote-components ejs:github --extractor-args youtube:player_client=mweb,tv,web_embedded" \
-              --output "/tmp/downloads/{title} - {artists}.{output-ext}" || true
+              --output "/tmp/downloads/{title} - {artists}.{output-ext}" \
+              2>&1 | tee /tmp/spotdl_log_${provider}.txt | grep -iE "pot token|audioprovidererror|forbidden|downloaded" || true
 
             AFTER=$(find /tmp/downloads -type f 2>/dev/null | wc -l)
             if [ "$AFTER" -gt "$BEFORE" ]; then
@@ -114,7 +119,7 @@ jobs:
 
           echo "success=$success" >> $GITHUB_OUTPUT
 
-      # ── ۶. مرحله دوم: فقط اگه مرحله اول شکست خورد ──────────────────
+      # ── ۶. مرحله دوم: فیلتر شل‌تر ────────────────────────────────
       - name: Download from Spotify (Loose Match Fallback)
         if: steps.strict_pass.outputs.success == '0'
         run: |
@@ -137,9 +142,11 @@ jobs:
               --dont-filter-results \
               --format mp3 \
               --bitrate 320k \
+              --log-level DEBUG \
               $COOKIE_ARG \
               --yt-dlp-args "--remote-components ejs:github --extractor-args youtube:player_client=mweb,tv,web_embedded" \
-              --output "/tmp/downloads/{title} - {artists} [loose-match].{output-ext}" || true
+              --output "/tmp/downloads/{title} - {artists} [loose-match].{output-ext}" \
+              2>&1 | tee /tmp/spotdl_log_loose_${provider}.txt | grep -iE "pot token|audioprovidererror|forbidden|downloaded" || true
 
             AFTER=$(find /tmp/downloads -type f 2>/dev/null | wc -l)
             if [ "$AFTER" -gt "$BEFORE" ]; then
@@ -151,7 +158,22 @@ jobs:
 
           [ "$success" -eq 0 ] && echo "::error::حتی با فیلتر شل هم چیزی پیدا نشد"
 
-      # ── ۷. اعتبارسنجی نهایی ─────────────────────────────────────
+      # ── ۷. در صورت شکست کامل — چاپ لاگ کامل برای عیب‌یابی دقیق ────
+      - name: Print full debug log if failed
+        if: always()
+        run: |
+          if [ -z "$(find /tmp/downloads -type f 2>/dev/null)" ]; then
+            echo "════════════════════════════════════"
+            echo "لاگ کامل برای تشخیص دقیق مشکل:"
+            echo "════════════════════════════════════"
+            for f in /tmp/spotdl_log_*.txt; do
+              [ -f "$f" ] || continue
+              echo "── $f ──"
+              grep -iE "pot token providers|pot token providers: none|bgutil" "$f" || echo "(هیچ خط PO Token ای پیدا نشد)"
+            done
+          fi
+
+      # ── ۸. اعتبارسنجی نهایی ─────────────────────────────────────
       - name: Validate final result
         run: |
           echo "Downloaded files:"
@@ -162,7 +184,7 @@ jobs:
           fi
           echo "✅ Download successful"
 
-      # ── ۸. فشرده‌سازی ───────────────────────────────────────────
+      # ── ۹. فشرده‌سازی ───────────────────────────────────────────
       - name: Archive audio files
         run: |
           mkdir -p /tmp/upload
@@ -177,7 +199,7 @@ jobs:
           fi
           echo "✅ Archive ready"
 
-      # ── ۹. چک‌اوت Repo2 ─────────────────────────────────────────
+      # ── ۱۰. چک‌اوت Repo2 ─────────────────────────────────────────
       - name: Checkout Repo2
         uses: actions/checkout@v4
         with:
@@ -185,7 +207,7 @@ jobs:
           token: ${{ secrets.SECOND_REPO_TOKEN }}
           path: repo2
 
-      # ── ۱۰. Force push ─────────────────────────────────────────────
+      # ── ۱۱. Force push ─────────────────────────────────────────────
       - name: Force push to Repo2 with job_meta
         run: |
           JOB_ID="${{ github.event.inputs.job_id }}"
